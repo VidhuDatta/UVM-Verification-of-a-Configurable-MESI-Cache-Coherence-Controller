@@ -1,0 +1,109 @@
+Great mindset — coding it yourself is exactly what will make this stick in interviews. Let me give you a clear structural roadmap.
+
+---
+
+## Phase 1: Define Your Interfaces First (Start Here)
+
+Before writing any logic, nail down the signals that connect everything. This prevents painful rewiring later.
+
+**Processor-to-Cache interface** — think of this as the "top" of each cache controller. It carries the processor request type (PrRd or PrWr), the target address, write data in, read data out, a request valid signal, and a stall/ready signal back to the processor (because the cache may need to go to the bus before it can respond).
+
+**Cache-to-Bus interface** — this is the "bottom" of each cache controller. It carries the bus request type (BusRd, BusRdX, BusUpgr, Flush), the address, data for flushes, a bus grant/request handshake, and the COPIES-EXIST (C) line. Each cache controller both drives requests onto the bus and snoops requests from other caches through this same interface.
+
+**Bus-to-Memory interface** — simple read/write port with address, data, and a ready signal to model memory latency.
+
+My recommendation: write a SystemVerilog `interface` for each of these three boundaries. This pays off massively when you get to the UVM testbench since you'll bind monitors directly to these interfaces.
+
+---
+
+## Phase 2: Address Decoding and Cache Storage
+
+Your cache is 4 sets, direct-mapped, 1 word per block. This means you need a 2-bit index to select the set. Decide on an address width — 8 bits is plenty for a verification project. That gives you a 2-bit index, and the remaining upper bits are the tag.
+
+For each cache line, you need to store: the tag, the data word, the MESI state (2 bits encoding M/E/S/I), and a valid bit (though I state effectively covers this).
+
+Implement this as a simple array of structs or parallel arrays — one per set. Don't overthink the storage; a `logic [DATA_WIDTH-1:0] data [0:NUM_SETS-1]` style array with corresponding tag and state arrays works perfectly.
+
+---
+
+## Phase 3: The MESI FSM — Build It in Two Halves
+
+This is the core of your design. The reference material shows the FSM as two parts and you should code it the same way, then merge them into one `always_ff` block with proper arbitration.
+
+**Half A — Processor-side transitions.** Start from each state and enumerate what happens on PrRd and PrWr:
+
+From I state: PrRd triggers a BusRd, then you land in E (if C line is low, meaning no other copies) or S (if C line is high). PrWr triggers a BusRdX, and you land in M.
+
+From S state: PrRd is a hit, stay in S. PrWr triggers a BusUpgr (not BusRdX, since you already have the data), then land in M.
+
+From E state: PrRd is a hit, stay in E. PrWr is a hit (silent upgrade, no bus transaction needed!), transition to M. This silent upgrade is a key difference from MSI — make sure you implement it correctly.
+
+From M state: PrRd is a hit, stay in M. PrWr is a hit, stay in M.
+
+**Half B — Snoop-side transitions.** These fire when you observe another cache's bus transaction:
+
+In M state: snooped BusRd means you must Flush (supply your dirty data), transition to S. Snooped BusRdX means you Flush and transition to I.
+
+In E state: snooped BusRd transitions to S. Snooped BusRdX transitions to I.
+
+In S state: snooped BusRd stays in S (no action needed). Snooped BusRdX or BusUpgr transitions to I.
+
+In I state: all snooped transactions are ignored.
+
+**The critical design decision** is what happens when processor-side and snoop-side requests arrive simultaneously for the same block. The snoop side must win — this is how transaction serialization works on the bus. If your processor has a pending write but a snoop arrives first with a BusRdX to the same address, you must invalidate, cancel your pending request, and retry.
+
+---
+
+## Phase 4: The Bus Arbiter
+
+Keep this simple. A round-robin or fixed-priority arbiter that accepts bus request signals from all four caches, grants one at a time, and holds the grant until the transaction completes. The arbiter needs to:
+
+Accept request lines from each cache controller (one-hot). Grant to one cache at a time. Broadcast the winning cache's bus transaction type and address to all other caches (for snooping). Manage the COPIES-EXIST (C) wire — this is an open-drain style signal where each snooping cache asserts it if it holds a valid copy of the requested block. The requesting cache samples C after all snoopers have responded.
+
+Model the arbitration as a two-phase process: the request phase (cache raises request, arbiter grants), and the snoop phase (transaction is broadcast, all snoopers respond with C line and optional Flush data, then the transaction completes). You can use a simple state machine in the arbiter: IDLE → GRANT → SNOOP → COMPLETE → IDLE.
+
+---
+
+## Phase 5: Main Memory Model
+
+This is the simplest piece. A memory array indexed by address. It responds to BusRd when no cache supplies data (Flush), and it absorbs Flush writebacks from dirty evictions. Give it a configurable latency parameter (even if you set it to 1 cycle initially) so you can stress timing later.
+
+One subtle point from your reference material: the memory controller must also snoop the bus. When a cache does a Flush (cache-to-cache transfer of dirty data), the memory should grab that data and update itself, or at minimum track that the block is dirty elsewhere and not serve stale data.
+
+---
+
+## Phase 6: Top-Level Integration
+
+Your `mesi_top.sv` instantiates 4 cache controllers, 1 bus arbiter, and 1 main memory, all wired through the interfaces you defined in Phase 1. Each cache controller gets its own processor-side interface (driven by the testbench later) and shares the bus interface.
+
+---
+
+## Recommended Coding Order
+
+I'd suggest this specific order because each piece is testable before you move on:
+
+**First**, write the interfaces and the package containing your type enums (MESI states, bus transaction types, processor request types). Having clean enums makes your FSM code readable and your waveform debugging much easier.
+
+**Second**, write the main memory — it's trivial and you can sanity test it standalone.
+
+**Third**, write the bus arbiter with one cache port first. Get arbitration and the snoop phase working for a single requester before scaling to four.
+
+**Fourth**, write one cache controller. Test it against the arbiter and memory with a directed stimulus (not UVM yet — just a simple SystemVerilog testbench that drives PrRd and PrWr). Walk through the Table 7.2 example from your reference material (R1, W1, R3, W3, R1, R3, R2) and verify you see the correct state transitions.
+
+**Fifth**, replicate to four cache controllers and run multi-processor scenarios.
+
+---
+
+## Common Pitfalls to Watch For
+
+The BusUpgr vs BusRdX distinction trips people up. BusUpgr is used when you're in S state and want to write — you already have the data so you just need others to invalidate. BusRdX is used when you're in I state and want to write — you need the data AND you need others to invalidate.
+
+The E→M silent upgrade must generate zero bus traffic. If you accidentally put a bus transaction here, your protocol is wrong and your scoreboard will catch it later.
+
+The C line timing matters. All snoopers must assert or deassert C before the requesting cache decides between E and S. Make sure your arbiter's snoop phase waits for all responses.
+
+Dirty eviction (a block in M state gets replaced because a new block maps to the same set) must generate a Flush writeback to memory even though no other cache requested it.
+
+---
+
+Start with the interfaces and the enum package. Once those are solid, everything else is just FSM logic hanging off clean signal boundaries. Want me to sketch out the testplan for verifying just the RTL before you layer UVM on top, or do you want to dive straight into structuring Day 2?
